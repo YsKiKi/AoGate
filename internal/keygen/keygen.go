@@ -128,7 +128,12 @@ func generateECDSA(name string) {
 }
 
 func saveFile(path string, data []byte) {
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	// 私钥文件使用 0600 权限，防止同机其他用户读取
+	perm := os.FileMode(0644)
+	if strings.HasSuffix(path, ".key") {
+		perm = 0600
+	}
+	if err := os.WriteFile(path, data, perm); err != nil {
 		panic(err)
 	}
 	fmt.Printf("已保存：%s\n", path)
