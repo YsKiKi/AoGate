@@ -1,0 +1,135 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: windows
+            goarch: amd64
+            ext: .exe
+            archive: zip
+          - goos: windows
+            goarch: arm64
+            ext: .exe
+            archive: zip
+          - goos: linux
+            goarch: amd64
+            ext: ''
+            archive: tar.gz
+          - goos: linux
+            goarch: arm64
+            ext: ''
+            archive: tar.gz
+          - goos: darwin
+            goarch: amd64
+            ext: ''
+            archive: tar.gz
+          - goos: darwin
+            goarch: arm64
+            ext: ''
+            archive: tar.gz
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build binaries
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          mkdir -p dist
+          go build -ldflags="-s -w" -o dist/launcher${{ matrix.ext }} ./cmd/launcher
+          go build -ldflags="-s -w" -o dist/packager${{ matrix.ext }} ./cmd/packager
+          go build -ldflags="-s -w" -o dist/server${{ matrix.ext }} ./cmd/server
+          go build -ldflags="-s -w" -o dist/keygen${{ matrix.ext }} ./cmd/keygen
+
+      - name: Copy resources
+        run: |
+          if [ -d res ] && [ "$(ls -A res 2>/dev/null)" ]; then
+            cp -r res dist/res
+          fi
+
+      - name: Create zip archive
+        if: matrix.archive == 'zip'
+        run: cd dist && zip -r ../aogate-${{ matrix.goos }}-${{ matrix.goarch }}.zip .
+
+      - name: Create tar.gz archive
+        if: matrix.archive == 'tar.gz'
+        run: cd dist && tar czf ../aogate-${{ matrix.goos }}-${{ matrix.goarch }}.tar.gz .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aogate-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: aogate-${{ matrix.goos }}-${{ matrix.goarch }}.*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: CHANGELOG.md
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate release notes
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          VERSION_SHORT="${VERSION#v}"
+          FOUND=false
+          NOTES=""
+          if [ -f CHANGELOG.md ]; then
+            while IFS= read -r line; do
+              if [[ "$line" =~ ^##[[:space:]] ]]; then
+                if $FOUND; then
+                  break
+                fi
+                if [[ "$line" == *"$VERSION"* ]] || [[ "$line" == *"$VERSION_SHORT"* ]]; then
+                  FOUND=true
+                  continue
+                fi
+              fi
+              if $FOUND; then
+                NOTES="${NOTES}${line}"$'\n'
+              fi
+            done < CHANGELOG.md
+          fi
+          if [ -z "$(echo "$NOTES" | tr -d '[:space:]')" ]; then
+            echo "New Release ${VERSION}" > release_notes.md
+          else
+            printf '%s' "$NOTES" > release_notes.md
+          fi
+
+      - name: Determine prerelease
+        id: prerelease
+        run: |
+          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          prerelease: ${{ steps.prerelease.outputs.prerelease }}
+          body_path: release_notes.md
