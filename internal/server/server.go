@@ -4,6 +4,7 @@ import (
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
@@ -95,12 +96,12 @@ type NamedKey struct {
 
 // 全局状态
 var (
-	whitelist   = make(map[string]Session)
-	usedNonces  = make(map[string]time.Time) // S1: 防重放攻击，key=sigHex，value=过期时间
-	mu          sync.RWMutex
-	pubKeys     []NamedKey
-	backend     string
-	blockLogger *log.Logger
+	whitelist         = make(map[string]Session)
+	pendingChallenges = make(map[string]time.Time) // challenge hex -> 过期时间，一次性使用
+	mu                sync.RWMutex
+	pubKeys           []NamedKey
+	backend           string
+	blockLogger       *log.Logger
 	// buffer pool for initial handshake
 	bufPool = sync.Pool{
 		New: func() interface{} {
@@ -424,13 +425,19 @@ func handleConnection(conn net.Conn) {
 
 	payload := string(buf[:n])
 
-	// 1. 判断是否是验证包
-	if strings.HasPrefix(payload, AuthPrefix) {
-		handleAuth(conn, payload, host)
+	// 1. 判断是否是认证握手请求 (第一阶段：客户端发送 GATE_AUTH 请求 challenge)
+	if payload == AuthPrefix || strings.TrimSpace(payload) == strings.TrimSuffix(AuthPrefix, ":") {
+		handleAuthChallenge(conn, host)
 		return
 	}
 
-	// 2. 如果不是验证包，检查白名单
+	// 2. 判断是否是认证响应 (第二阶段：GATE_RESP:challenge:timestamp:signature)
+	if strings.HasPrefix(payload, "GATE_RESP:") {
+		handleAuthResponse(conn, payload, host)
+		return
+	}
+
+	// 3. 如果不是验证包，检查白名单
 	allowed, id := isWhitelisted(host)
 	if allowed {
 		log.Printf("Allowing connection from %s (ID: %s)", host, id)
@@ -448,18 +455,62 @@ func handleConnection(conn net.Conn) {
 	}
 }
 
-func handleAuth(conn net.Conn, payload string, ip string) {
+// handleAuthChallenge 处理认证第一阶段：生成并发送 challenge
+func handleAuthChallenge(conn net.Conn, ip string) {
+	// 生成 32 字节随机 challenge
+	challenge := make([]byte, 32)
+	if _, err := rand.Read(challenge); err != nil {
+		log.Printf("Failed to generate challenge for %s: %v", ip, err)
+		conn.Close()
+		return
+	}
+	challengeHex := hex.EncodeToString(challenge)
+
+	// 注册 challenge，有效期 30 秒
+	mu.Lock()
+	pendingChallenges[challengeHex] = time.Now().Add(30 * time.Second)
+	mu.Unlock()
+
+	// 发送 challenge 给客户端
+	if _, err := conn.Write([]byte("CHALLENGE:" + challengeHex)); err != nil {
+		log.Printf("Write challenge error to %s: %v", ip, err)
+	}
+	conn.Close()
+}
+
+// handleAuthResponse 处理认证第二阶段：验证 challenge + timestamp 签名
+func handleAuthResponse(conn net.Conn, payload string, ip string) {
 	defer conn.Close()
 
-	parts := strings.Split(payload, ":")
-	if len(parts) != 3 {
-		log.Printf("Auth format error from %s", ip)
+	// 格式: GATE_RESP:challengeHex:timestamp:signatureHex
+	parts := strings.SplitN(payload, ":", 4)
+	if len(parts) != 4 {
+		log.Printf("Auth response format error from %s", ip)
 		return
 	}
 
-	tsStr := parts[1]
-	sigHex := parts[2]
+	challengeHex := parts[1]
+	tsStr := parts[2]
+	sigHex := parts[3]
 
+	// 验证 challenge 是否有效（一次性消费）
+	mu.Lock()
+	expiry, exists := pendingChallenges[challengeHex]
+	if !exists || time.Now().After(expiry) {
+		if exists {
+			delete(pendingChallenges, challengeHex)
+		}
+		mu.Unlock()
+		log.Printf("Auth invalid/expired challenge from %s", ip)
+		conn.Write([]byte("INVALID_CHALLENGE"))
+		reportEvent(EventDecision, ip, "未知", "拦截", "无效挑战值")
+		return
+	}
+	// 消费 challenge，防止重放
+	delete(pendingChallenges, challengeHex)
+	mu.Unlock()
+
+	// 检查时间戳
 	var ts int64
 	_, err := fmt.Sscanf(tsStr, "%d", &ts)
 	if err != nil {
@@ -469,14 +520,13 @@ func handleAuth(conn net.Conn, payload string, ip string) {
 	reqTime := time.Unix(ts, 0)
 	if time.Since(reqTime).Abs() > 2*time.Minute {
 		log.Printf("Auth timestamp expired from %s", ip)
-		if _, err := conn.Write([]byte("EXPIRED")); err != nil {
-			log.Printf("Write error to %s: %v", ip, err)
-		}
+		conn.Write([]byte("EXPIRED"))
 		reportEvent(EventDecision, ip, "未知", "拦截", "鉴权过期")
 		return
 	}
 
-	msg := []byte(tsStr)
+	// 签名内容 = challenge_hex + ":" + timestamp
+	msg := []byte(challengeHex + ":" + tsStr)
 	sig, err := hex.DecodeString(sigHex)
 	if err != nil {
 		log.Printf("Auth signature invalid hex from %s", ip)
@@ -487,31 +537,16 @@ func handleAuth(conn net.Conn, payload string, ip string) {
 	valid, id := checkSignature(msg, sig)
 	if valid {
 		mu.Lock()
-		// S1: 重放攻击检查（在签名成功后、更新状态前）
-		if _, used := usedNonces[sigHex]; used {
-			mu.Unlock()
-			log.Printf("Auth REPLAY attack blocked from %s", ip)
-			if _, err := conn.Write([]byte("REPLAY")); err != nil {
-				log.Printf("Write error to %s: %v", ip, err)
-			}
-			reportEvent(EventDecision, ip, "未知", "拦截", "重放攻击")
-			return
-		}
-
 		// 检查IP绑定
-		session, exists := whitelist[ip]
-		if exists && time.Now().Before(session.ExpiresAt) && session.ID != id {
+		session, bound := whitelist[ip]
+		if bound && time.Now().Before(session.ExpiresAt) && session.ID != id {
 			mu.Unlock()
 			log.Printf("Auth REJECTED for IP: %s (Locked by %s, tried %s)", ip, session.ID, id)
 			reportEvent(EventDecision, ip, session.ID, "拦截", "IP已被其他玩家绑定")
-			if _, err := conn.Write([]byte("LOCKED")); err != nil {
-				log.Printf("Write error to %s: %v", ip, err)
-			}
+			conn.Write([]byte("LOCKED"))
 			return
 		}
 
-		// 记录 nonce（4分钟，双倍时间窗口）并更新白名单（均在锁内原子完成）
-		usedNonces[sigHex] = time.Now().Add(4 * time.Minute)
 		whitelist[ip] = Session{
 			ID:        id,
 			ExpiresAt: time.Now().Add(time.Duration(config.AuthValidity)),
@@ -521,15 +556,11 @@ func handleAuth(conn net.Conn, payload string, ip string) {
 
 		log.Printf("Auth SUCCESS for IP: %s (ID: %s)", ip, id)
 		reportEvent(EventDecision, ip, id, "允许", "鉴权成功")
-		if _, err := conn.Write([]byte("OK")); err != nil {
-			log.Printf("Write error to %s: %v", ip, err)
-		}
+		conn.Write([]byte("OK"))
 	} else {
 		log.Printf("Auth FAILED for IP: %s (Crypto check failed)", ip)
 		reportEvent(EventDecision, ip, "未知", "拦截", "签名校验失败")
-		if _, err := conn.Write([]byte("FAIL")); err != nil {
-			log.Printf("Write error to %s: %v", ip, err)
-		}
+		conn.Write([]byte("FAIL"))
 	}
 }
 
@@ -679,10 +710,10 @@ func cleanupLoop() {
 				dirty = true
 			}
 		}
-		// S1: 清理过期 nonce
-		for nonce, expiry := range usedNonces {
+		// 清理过期 challenge
+		for ch, expiry := range pendingChallenges {
 			if now.After(expiry) {
-				delete(usedNonces, nonce)
+				delete(pendingChallenges, ch)
 			}
 		}
 		if dirty {
