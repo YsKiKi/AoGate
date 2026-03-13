@@ -50,6 +50,11 @@ func initMonitor(targetAddr string) {
 		wsURL = fmt.Sprintf("ws://127.0.0.1:%s", targetAddr)
 	}
 
+	// 安全警告：非 wss:// 连接的监控数据以明文传输
+	if !strings.HasPrefix(wsURL, "wss://") {
+		log.Printf("Monitor: WARNING - using unencrypted WebSocket (ws://). Consider using wss:// for production.")
+	}
+
 	wsSendCh = make(chan MonitorEvent, 100)
 
 	// 启动 WS 客户端守护协程
@@ -61,23 +66,21 @@ func reportEvent(eventType EventType, ip string, id string, action string, reaso
 	if wsSendCh == nil {
 		return
 	}
-	go func() {
-		event := MonitorEvent{
-			Type:      eventType,
-			Timestamp: time.Now().Unix(),
-			IP:        ip,
-			ID:        id,
-			Action:    action,
-			Reason:    reason,
-		}
+	event := MonitorEvent{
+		Type:      eventType,
+		Timestamp: time.Now().Unix(),
+		IP:        ip,
+		ID:        id,
+		Action:    action,
+		Reason:    reason,
+	}
 
-		// 尝试发送到通道，如果满了就丢弃，避免阻塞
-		select {
-		case wsSendCh <- event:
-		default:
-			// Channel full, drop event
-		}
-	}()
+	// 非阻塞发送，满了就丢弃
+	select {
+	case wsSendCh <- event:
+	default:
+		// Channel full, drop event
+	}
 }
 
 func wsClientLoop() {
