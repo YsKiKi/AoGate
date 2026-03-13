@@ -52,16 +52,17 @@ jobs:
           CGO_ENABLED: '0'
         run: |
           mkdir -p dist
-          go build -ldflags="-s -w" -o dist/launcher${{ matrix.ext }} ./cmd/launcher
           go build -ldflags="-s -w" -o dist/packager${{ matrix.ext }} ./cmd/packager
           go build -ldflags="-s -w" -o dist/server${{ matrix.ext }} ./cmd/server
           go build -ldflags="-s -w" -o dist/keygen${{ matrix.ext }} ./cmd/keygen
-
-      - name: Copy resources
-        run: |
-          if [ -d res ] && [ "$(ls -A res 2>/dev/null)" ]; then
-            cp -r res dist/res
-          fi
+          
+          mkdir -p dist/launchers/windows-amd64 dist/launchers/windows-arm64 dist/launchers/linux-amd64 dist/launchers/linux-arm64 dist/launchers/darwin-amd64 dist/launchers/darwin-arm64
+          GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o dist/launchers/windows-amd64/launcher.exe ./cmd/launcher
+          GOOS=windows GOARCH=arm64 go build -ldflags="-s -w" -o dist/launchers/windows-arm64/launcher.exe ./cmd/launcher
+          GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o dist/launchers/linux-amd64/launcher ./cmd/launcher
+          GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o dist/launchers/linux-arm64/launcher ./cmd/launcher
+          GOOS=darwin GOARCH=amd64 go build -ldflags="-s -w" -o dist/launchers/darwin-amd64/launcher ./cmd/launcher
+          GOOS=darwin GOARCH=arm64 go build -ldflags="-s -w" -o dist/launchers/darwin-arm64/launcher ./cmd/launcher
 
       - name: Create zip archive
         if: matrix.archive == 'zip'

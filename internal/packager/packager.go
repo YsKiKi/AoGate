@@ -25,48 +25,51 @@ var supportedPlatforms = []platformSpec{
 		label:  "Windows x64",
 		key:    "windows-amd64",
 		zipExe: "launcher.exe",
-		dirs:   []string{".", "build/windows", "build/windows/amd64"},
+		dirs:   []string{".", "launchers/windows-amd64", "build/windows", "build/windows/amd64"},
 	},
 	{
 		label:  "Windows ARM64",
 		key:    "windows-arm64",
 		zipExe: "launcher.exe",
-		dirs:   []string{".", "build/windows/arm64"},
+		dirs:   []string{".", "launchers/windows-arm64", "build/windows/arm64"},
 	},
 	{
 		label:  "Linux x64",
 		key:    "linux-amd64",
 		zipExe: "launcher",
-		dirs:   []string{".", "build/linux", "build/linux/amd64"},
+		dirs:   []string{".", "launchers/linux-amd64", "build/linux", "build/linux/amd64"},
 	},
 	{
 		label:  "Linux ARM64",
 		key:    "linux-arm64",
 		zipExe: "launcher",
-		dirs:   []string{".", "build/linux/arm64"},
+		dirs:   []string{".", "launchers/linux-arm64", "build/linux/arm64"},
 	},
 	{
 		label:  "macOS x64",
 		key:    "darwin-amd64",
 		zipExe: "launcher",
-		dirs:   []string{".", "build/darwin", "build/darwin/amd64"},
+		dirs:   []string{".", "launchers/darwin-amd64", "build/darwin", "build/darwin/amd64"},
 	},
 	{
 		label:  "macOS ARM64 (Apple Silicon)",
 		key:    "darwin-arm64",
 		zipExe: "launcher",
-		dirs:   []string{".", "build/darwin/arm64"},
+		dirs:   []string{".", "launchers/darwin-arm64", "build/darwin/arm64"},
 	},
 }
 
 // findExeForPlatform 在平台指定的目录中搜索可执行文件
 func findExeForPlatform(spec platformSpec) string {
-	// 构建搜索路径：可执行文件自身目录 + 平台定义目录
-	searchDirs := spec.dirs
+	var searchDirs []string
 	if exePath, err := os.Executable(); err == nil {
 		exeDir := filepath.Dir(exePath)
-		searchDirs = append([]string{exeDir}, searchDirs...)
+		searchDirs = append(searchDirs, exeDir)
+		for _, d := range spec.dirs {
+			searchDirs = append(searchDirs, filepath.Join(exeDir, d))
+		}
 	}
+	searchDirs = append(searchDirs, spec.dirs...)
 
 	for _, dir := range searchDirs {
 		p := filepath.Join(dir, spec.zipExe)
