@@ -95,28 +95,55 @@ func Run(args []string) {
 	}
 	defer conn.Close()
 
-	// 构造载荷
+	// 第一步：发送认证握手请求，获取 challenge
+	fmt.Printf("正在向网关发送验证请求...\n")
+	_, err = conn.Write([]byte("GATE_AUTH:"))
+	if err != nil {
+		log.Fatalf("发送握手请求失败: %v", err)
+	}
+
+	// 读取 challenge 响应
+	buf := make([]byte, 1024)
+	n, err := conn.Read(buf)
+	if err != nil && err != io.EOF {
+		log.Fatalf("读取 challenge 失败: %v", err)
+	}
+	challengeResp := string(buf[:n])
+
+	if !strings.HasPrefix(challengeResp, "CHALLENGE:") {
+		log.Fatalf("服务器返回非预期响应: %s", challengeResp)
+	}
+	challengeHex := strings.TrimPrefix(challengeResp, "CHALLENGE:")
+
+	// 第二步：签名 challenge + timestamp 并通过新连接发送
+	conn.Close()
+
+	conn2, err := net.Dial("tcp", targetAddr)
+	if err != nil {
+		log.Fatalf("重新连接服务器失败: %v", err)
+	}
+	defer conn2.Close()
+
 	ts := time.Now().Unix()
 	tsStr := fmt.Sprintf("%d", ts)
 
-	// 签名
-	sig, err := signMessage(signer, tsStr)
+	// 签名内容 = challengeHex + ":" + timestamp
+	signContent := challengeHex + ":" + tsStr
+	sig, err := signMessage(signer, signContent)
 	if err != nil {
 		log.Fatalf("签名失败: %v", err)
 	}
 	sigHex := hex.EncodeToString(sig)
 
-	payload := fmt.Sprintf("GATE_AUTH:%s:%s", tsStr, sigHex)
+	payload := fmt.Sprintf("GATE_RESP:%s:%s:%s", challengeHex, tsStr, sigHex)
 
-	fmt.Printf("正在向网关发送验证请求...\n")
-	_, err = conn.Write([]byte(payload))
+	_, err = conn2.Write([]byte(payload))
 	if err != nil {
 		log.Fatalf("发送验证载荷失败: %v", err)
 	}
 
 	// 等待响应
-	buf := make([]byte, 1024)
-	n, err := conn.Read(buf)
+	n, err = conn2.Read(buf)
 	if err != nil && err != io.EOF {
 		log.Fatalf("读取服务器响应错误: %v", err)
 	}
