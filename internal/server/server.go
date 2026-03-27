@@ -31,6 +31,7 @@ const (
 	AuthPrefix      = "GATE_AUTH:"
 	CleanupInterval = 10 * time.Minute
 	WhitelistFile   = "whitelist.json"
+	BannedIPFile    = "banned_ip.txt"
 )
 
 // ConfigDuration 自定义Duration以支持YAML字符串格式
@@ -60,26 +61,32 @@ func (d ConfigDuration) MarshalYAML() (interface{}, error) {
 
 // ServerConfig 配置结构体
 type ServerConfig struct {
-	ListenAddr   string         `yaml:"listen_addr"`
-	BackendAddr  string         `yaml:"backend_addr"`
-	KeyPath      string         `yaml:"key_path"`
-	MonitorAddr  string         `yaml:"monitor_addr"`
-	AuthValidity ConfigDuration `yaml:"auth_validity"`
-	LogDir       string         `yaml:"log_dir"`
-	MaxLogSize   int64          `yaml:"max_log_size"`
-	MaxLogFiles  int            `yaml:"max_log_files"`
+	ListenAddr      string         `yaml:"listen_addr"`
+	BackendAddr     string         `yaml:"backend_addr"`
+	KeyPath         string         `yaml:"key_path"`
+	MonitorAddr     string         `yaml:"monitor_addr"`
+	AuthValidity    ConfigDuration `yaml:"auth_validity"`
+	LogDir          string         `yaml:"log_dir"`
+	MaxLogSize      int64          `yaml:"max_log_size"`
+	MaxLogFiles     int            `yaml:"max_log_files"`
+	RateLimitWindow ConfigDuration `yaml:"rate_limit_window"` // t: 滑动窗口时长
+	RateLimitMax    int            `yaml:"rate_limit_max"`    // n: 窗口内最大连接次数
+	BanDuration     ConfigDuration `yaml:"ban_duration"`      // m: 封禁时长
 }
 
 // 默认配置
 var config = ServerConfig{
-	ListenAddr:   "",
-	BackendAddr:  "",
-	KeyPath:      "keys",
-	MonitorAddr:  "",
-	AuthValidity: ConfigDuration(12 * time.Hour),
-	LogDir:       "log",
-	MaxLogSize:   10 * 1024 * 1024, // 10MB
-	MaxLogFiles:  3,
+	ListenAddr:      "",
+	BackendAddr:     "",
+	KeyPath:         "keys",
+	MonitorAddr:     "",
+	AuthValidity:    ConfigDuration(12 * time.Hour),
+	LogDir:          "log",
+	MaxLogSize:      10 * 1024 * 1024, // 10MB
+	MaxLogFiles:     3,
+	RateLimitWindow: ConfigDuration(1 * time.Minute),  // 1 分钟滑动窗口
+	RateLimitMax:    30,                               // 30 次/分钟
+	BanDuration:     ConfigDuration(10 * time.Minute), // 封禁 10 分钟
 }
 
 // Session 结构体
@@ -110,6 +117,154 @@ var (
 		},
 	}
 )
+
+// ===== 速率限制与 IP 封禁 =====
+
+// rlEntry 记录单个限速键的连接尝试历史与封禁状态
+type rlEntry struct {
+	tries    []time.Time // 滑动窗口内的连接时间戳
+	banUntil time.Time   // 封禁截止时间（零值表示未被封禁）
+}
+
+var (
+	rlMu    sync.Mutex
+	rlTable = make(map[string]*rlEntry)
+)
+
+// rateLimitKey 生成速率限制键。
+// IPv4 使用精确的 IP 地址；IPv6 使用 /64 前缀（高 64 位），
+// 防止攻击者通过轮换低 64 位来绕过限速。
+func rateLimitKey(ip string) string {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return ip
+	}
+	if v4 := parsed.To4(); v4 != nil {
+		return v4.String()
+	}
+	// IPv6：取 /64 网段作为限速键
+	_, ipNet, err := net.ParseCIDR(ip + "/64")
+	if err != nil || ipNet == nil {
+		return ip
+	}
+	return ipNet.String()
+}
+
+// checkRateLimit 检查并记录一次连接尝试。
+// 若当前键已被封禁或本次触发封禁，返回 true 及原因字符串。
+// 当 RateLimitMax <= 0 时功能禁用，始终返回 false。
+func checkRateLimit(key string) (blocked bool, reason string) {
+	if config.RateLimitMax <= 0 {
+		return false, ""
+	}
+
+	now := time.Now()
+	window := time.Duration(config.RateLimitWindow)
+	banDur := time.Duration(config.BanDuration)
+
+	rlMu.Lock()
+	defer rlMu.Unlock()
+
+	entry := rlTable[key]
+	if entry == nil {
+		entry = &rlEntry{}
+		rlTable[key] = entry
+	}
+
+	// 已在封禁期内
+	if now.Before(entry.banUntil) {
+		remaining := entry.banUntil.Sub(now).Truncate(time.Second)
+		return true, fmt.Sprintf("IP banned, %s remaining", remaining)
+	}
+
+	// 滑动窗口：移除超出时间范围的旧记录
+	cutoff := now.Add(-window)
+	j := 0
+	for _, t := range entry.tries {
+		if t.After(cutoff) {
+			entry.tries[j] = t
+			j++
+		}
+	}
+	entry.tries = entry.tries[:j]
+
+	// 记录本次连接
+	entry.tries = append(entry.tries, now)
+
+	// 超过阈值则封禁
+	if len(entry.tries) > config.RateLimitMax {
+		entry.banUntil = now.Add(banDur)
+		entry.tries = nil // 封禁后清空，节省内存
+		saveBannedIPs()   // 持久化（rlMu 已持有）
+		return true, fmt.Sprintf("rate limit exceeded (%d per %s), banned for %s",
+			config.RateLimitMax, window, banDur)
+	}
+
+	return false, ""
+}
+
+// saveBannedIPs 将当前所有有效封禁写入 banned_ip.txt。
+// 调用方必须持有 rlMu。
+func saveBannedIPs() {
+	f, err := os.Create(BannedIPFile)
+	if err != nil {
+		log.Printf("Failed to save banned_ip.txt: %v", err)
+		return
+	}
+	defer f.Close()
+
+	now := time.Now()
+	fmt.Fprintf(f, "# banned_ip.txt — auto-generated, do not edit while server is running\n")
+	fmt.Fprintf(f, "# format: <key> <unix_expiry>\n")
+	fmt.Fprintf(f, "# delete a line or set expiry to 0 to unban (takes effect on restart)\n")
+	for key, entry := range rlTable {
+		if entry.banUntil.After(now) {
+			fmt.Fprintf(f, "%s %d\n", key, entry.banUntil.Unix())
+		}
+	}
+}
+
+// loadBannedIPs 从 banned_ip.txt 恢复封禁状态，在服务启动时调用。
+func loadBannedIPs() {
+	data, err := os.ReadFile(BannedIPFile)
+	if err != nil {
+		return // 文件不存在时静默跳过
+	}
+
+	now := time.Now()
+	count := 0
+	rlMu.Lock()
+	defer rlMu.Unlock()
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
+		}
+		key := fields[0]
+		var unix int64
+		if _, err := fmt.Sscanf(fields[1], "%d", &unix); err != nil || unix == 0 {
+			continue
+		}
+		expiry := time.Unix(unix, 0)
+		if expiry.Before(now) {
+			continue // 已过期，跳过
+		}
+		entry := rlTable[key]
+		if entry == nil {
+			entry = &rlEntry{}
+			rlTable[key] = entry
+		}
+		entry.banUntil = expiry
+		count++
+	}
+	if count > 0 {
+		log.Printf("Loaded %d active bans from %s", count, BannedIPFile)
+	}
+}
 
 // RotatingLogger 实现自动轮换的日志记录器
 type RotatingLogger struct {
@@ -238,6 +393,17 @@ max_log_size: %d
 
 # Max log files / 保留日志文件数量
 max_log_files: %d
+
+# Rate limit window / 速率限制时间窗口 (t)
+# Count connection attempts within this window per IP
+rate_limit_window: %s
+
+# Rate limit max / 窗口内最大连接次数 (n)
+# Set to 0 to disable rate limiting
+rate_limit_max: %d
+
+# Ban duration / 触发限速后的封禁时长 (m)
+ban_duration: %s
 `,
 		time.Now().Format(time.RFC3339),
 		config.ListenAddr,
@@ -248,6 +414,9 @@ max_log_files: %d
 		config.LogDir,
 		config.MaxLogSize,
 		config.MaxLogFiles,
+		time.Duration(config.RateLimitWindow).String(),
+		config.RateLimitMax,
+		time.Duration(config.BanDuration).String(),
 	)
 
 	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
@@ -368,6 +537,9 @@ func Run(args []string) {
 	// 加载持久化白名单
 	loadWhitelist()
 
+	// 加载持久化封禁名单
+	loadBannedIPs()
+
 	// 启动清理过期 IP 的协程
 	go cleanupLoop()
 
@@ -407,6 +579,19 @@ func handleConnection(conn net.Conn) {
 	// 获取 IP，规范化处理 IPv4-mapped IPv6 地址
 	rawHost, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
 	host := normalizeIP(rawHost)
+
+	// 速率限制 / IP 封禁检查（在读取任何数据前执行）
+	rlKey := rateLimitKey(host)
+	if blocked, reason := checkRateLimit(rlKey); blocked {
+		msg := fmt.Sprintf("Blocking connection from %s (%s): %s", host, rlKey, reason)
+		log.Println(msg)
+		if blockLogger != nil {
+			blockLogger.Println(msg)
+		}
+		reportEvent(EventDecision, host, "未知", "拦截", reason)
+		conn.Close()
+		return
+	}
 
 	// 设置读取超时，防止恶意连接占着茅坑不拉屎
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -720,6 +905,21 @@ func cleanupLoop() {
 			saveWhitelist()
 		}
 		mu.Unlock()
+
+		// 清理速率限制表中已过期的封禁和空条目
+		rlMu.Lock()
+		banDirty := false
+		for key, entry := range rlTable {
+			// 若封禁已过期且滑动窗口内无记录，则删除条目
+			if now.After(entry.banUntil) && len(entry.tries) == 0 {
+				delete(rlTable, key)
+				banDirty = true
+			}
+		}
+		if banDirty {
+			saveBannedIPs() // 过期条目已清除，重写文件
+		}
+		rlMu.Unlock()
 	}
 }
 
