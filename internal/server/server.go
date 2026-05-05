@@ -203,6 +203,22 @@ func checkRateLimit(key string) (blocked bool, reason string) {
 	return false, ""
 }
 
+// clearRateLimit 清除指定键的限速记录与封禁状态（鉴权成功时调用，避免合法玩家卡死）
+func clearRateLimit(key string) {
+	if config.RateLimitMax <= 0 {
+		return
+	}
+	rlMu.Lock()
+	defer rlMu.Unlock()
+	if entry, ok := rlTable[key]; ok {
+		wasBanned := entry.banUntil.After(time.Now())
+		delete(rlTable, key)
+		if wasBanned {
+			saveBannedIPs() // 持久化更新
+		}
+	}
+}
+
 // saveBannedIPs 将当前所有有效封禁写入 banned_ip.txt。
 // 调用方必须持有 rlMu。
 func saveBannedIPs() {
@@ -581,16 +597,19 @@ func handleConnection(conn net.Conn) {
 	host := normalizeIP(rawHost)
 
 	// 速率限制 / IP 封禁检查（在读取任何数据前执行）
-	rlKey := rateLimitKey(host)
-	if blocked, reason := checkRateLimit(rlKey); blocked {
-		msg := fmt.Sprintf("Blocking connection from %s (%s): %s", host, rlKey, reason)
-		log.Println(msg)
-		if blockLogger != nil {
-			blockLogger.Println(msg)
+	// 已在白名单内的 IP 跳过限速，避免合法玩家因客户端正常多次连接（status ping/login 等）被封
+	if allowed, _ := isWhitelisted(host); !allowed {
+		rlKey := rateLimitKey(host)
+		if blocked, reason := checkRateLimit(rlKey); blocked {
+			msg := fmt.Sprintf("Blocking connection from %s (%s): %s", host, rlKey, reason)
+			log.Println(msg)
+			if blockLogger != nil {
+				blockLogger.Println(msg)
+			}
+			reportEvent(EventDecision, host, "未知", "拦截", reason)
+			conn.Close()
+			return
 		}
-		reportEvent(EventDecision, host, "未知", "拦截", reason)
-		conn.Close()
-		return
 	}
 
 	// 设置读取超时，防止恶意连接占着茅坑不拉屎
@@ -738,6 +757,9 @@ func handleAuthResponse(conn net.Conn, payload string, ip string) {
 		}
 		saveWhitelist()
 		mu.Unlock()
+
+		// 鉴权成功，清除该 IP 的限速与封禁，避免历史封禁卡死合法玩家
+		clearRateLimit(rateLimitKey(ip))
 
 		log.Printf("Auth SUCCESS for IP: %s (ID: %s)", ip, id)
 		reportEvent(EventDecision, ip, id, "允许", "鉴权成功")
