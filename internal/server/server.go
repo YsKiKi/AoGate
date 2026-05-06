@@ -616,18 +616,13 @@ func handleConnection(conn net.Conn) {
 	host := normalizeIP(rawHost)
 	rlKey := rateLimitKey(host)
 
-	// 已封禁的 IP 直接拒绝（不区分包类型，封禁期内一律拦截）。
-	// 注意：此处只查询封禁状态，不增加计数；计数发生在确认是"非鉴权 & 非白名单"野连接时。
-	if blocked, reason := isBanned(rlKey); blocked {
-		msg := fmt.Sprintf("Blocking connection from %s (%s): %s", host, rlKey, reason)
-		log.Println(msg)
-		if blockLogger != nil {
-			blockLogger.Println(msg)
-		}
-		reportEvent(EventDecision, host, "未知", "拦截", reason)
-		conn.Close()
-		return
-	}
+	// 注意：此处不再做"封禁早退"。原实现会在判断包类型之前直接拒绝被封禁 IP，
+	// 这导致两个问题：
+	//   (1) 被封禁的合法用户无法通过鉴权重新解封（鉴权握手包被一并拦截）；
+	//   (2) NAT 场景下多人共用出口 IP，其中一人触发限速后，
+	//       已经鉴权（在白名单内）的其他合法用户也会被株连封禁。
+	// 解决方案：把封禁检查推迟到"既非鉴权握手、也不在白名单"的分支，
+	// 让鉴权与白名单流量始终绕过封禁，仅对真正的野连接生效。
 
 	// 设置读取超时，防止恶意连接占着茅坑不拉屎
 	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
@@ -647,19 +642,23 @@ func handleConnection(conn net.Conn) {
 	payload := string(buf[:n])
 
 	// 1. 判断是否是认证握手请求 (第一阶段：客户端发送 GATE_AUTH 请求 challenge)
-	//    鉴权握手包不计入速率限制，确保 launcher 始终能完成认证
+	//    鉴权握手包不计入速率限制、且绕过封禁检查，
+	//    确保被误封的合法用户 / NAT 后的新用户始终能完成认证。
 	if payload == AuthPrefix || strings.TrimSpace(payload) == strings.TrimSuffix(AuthPrefix, ":") {
 		handleAuthChallenge(conn, host)
 		return
 	}
 
 	// 2. 判断是否是认证响应 (第二阶段：GATE_RESP:challenge:timestamp:signature)
+	//    同样绕过封禁检查；鉴权成功后会自动 clearRateLimit 解封。
 	if strings.HasPrefix(payload, "GATE_RESP:") {
 		handleAuthResponse(conn, payload, host)
 		return
 	}
 
 	// 3. 如果不是验证包，检查白名单
+	//    白名单内的连接绕过封禁检查 —— NAT 场景下，只要有一名用户已成功鉴权，
+	//    其后续连接就不会因同 IP 邻居作恶导致的封禁而被株连。
 	allowed, id := isWhitelisted(host)
 	if allowed {
 		log.Printf("Allowing connection from %s (ID: %s)", host, id)
@@ -668,7 +667,20 @@ func handleConnection(conn net.Conn) {
 		return
 	}
 
-	// 4. 既非鉴权握手、也不在白名单 —— 此时才计入速率限制
+	// 4. 既非鉴权握手、也不在白名单 —— 此时才施加封禁/限速。
+	//    先看是否已在封禁期内（仅查询，不计数）。
+	if blocked, reason := isBanned(rlKey); blocked {
+		msg := fmt.Sprintf("Blocking connection from %s (%s): %s", host, rlKey, reason)
+		log.Println(msg)
+		if blockLogger != nil {
+			blockLogger.Println(msg)
+		}
+		reportEvent(EventDecision, host, "未知", "拦截", reason)
+		conn.Close()
+		return
+	}
+
+	// 5. 计入本次野连接尝试，超阈值则触发新的封禁。
 	if blocked, reason := checkRateLimit(rlKey); blocked {
 		msg := fmt.Sprintf("Blocking connection from %s (%s): %s", host, rlKey, reason)
 		log.Println(msg)
