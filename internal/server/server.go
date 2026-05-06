@@ -150,6 +150,25 @@ func rateLimitKey(ip string) string {
 	return ipNet.String()
 }
 
+// isBanned 仅检查指定键当前是否处于封禁期内，不修改任何状态。
+func isBanned(key string) (bool, string) {
+	if config.RateLimitMax <= 0 {
+		return false, ""
+	}
+	rlMu.Lock()
+	defer rlMu.Unlock()
+	entry := rlTable[key]
+	if entry == nil {
+		return false, ""
+	}
+	now := time.Now()
+	if now.Before(entry.banUntil) {
+		remaining := entry.banUntil.Sub(now).Truncate(time.Second)
+		return true, fmt.Sprintf("IP banned, %s remaining", remaining)
+	}
+	return false, ""
+}
+
 // checkRateLimit 检查并记录一次连接尝试。
 // 若当前键已被封禁或本次触发封禁，返回 true 及原因字符串。
 // 当 RateLimitMax <= 0 时功能禁用，始终返回 false。
@@ -595,21 +614,19 @@ func handleConnection(conn net.Conn) {
 	// 获取 IP，规范化处理 IPv4-mapped IPv6 地址
 	rawHost, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
 	host := normalizeIP(rawHost)
+	rlKey := rateLimitKey(host)
 
-	// 速率限制 / IP 封禁检查（在读取任何数据前执行）
-	// 已在白名单内的 IP 跳过限速，避免合法玩家因客户端正常多次连接（status ping/login 等）被封
-	if allowed, _ := isWhitelisted(host); !allowed {
-		rlKey := rateLimitKey(host)
-		if blocked, reason := checkRateLimit(rlKey); blocked {
-			msg := fmt.Sprintf("Blocking connection from %s (%s): %s", host, rlKey, reason)
-			log.Println(msg)
-			if blockLogger != nil {
-				blockLogger.Println(msg)
-			}
-			reportEvent(EventDecision, host, "未知", "拦截", reason)
-			conn.Close()
-			return
+	// 已封禁的 IP 直接拒绝（不区分包类型，封禁期内一律拦截）。
+	// 注意：此处只查询封禁状态，不增加计数；计数发生在确认是"非鉴权 & 非白名单"野连接时。
+	if blocked, reason := isBanned(rlKey); blocked {
+		msg := fmt.Sprintf("Blocking connection from %s (%s): %s", host, rlKey, reason)
+		log.Println(msg)
+		if blockLogger != nil {
+			blockLogger.Println(msg)
 		}
+		reportEvent(EventDecision, host, "未知", "拦截", reason)
+		conn.Close()
+		return
 	}
 
 	// 设置读取超时，防止恶意连接占着茅坑不拉屎
@@ -630,6 +647,7 @@ func handleConnection(conn net.Conn) {
 	payload := string(buf[:n])
 
 	// 1. 判断是否是认证握手请求 (第一阶段：客户端发送 GATE_AUTH 请求 challenge)
+	//    鉴权握手包不计入速率限制，确保 launcher 始终能完成认证
 	if payload == AuthPrefix || strings.TrimSpace(payload) == strings.TrimSuffix(AuthPrefix, ":") {
 		handleAuthChallenge(conn, host)
 		return
@@ -647,16 +665,29 @@ func handleConnection(conn net.Conn) {
 		log.Printf("Allowing connection from %s (ID: %s)", host, id)
 		reportEvent(EventDecision, host, id, "允许", "白名单")
 		proxyConnection(conn, buf[:n])
-	} else {
-		// 记录拒绝日志到单独文件
-		msg := fmt.Sprintf("Blocking connection from %s (Not Whitelisted)", host)
-		log.Println(msg) // 同时也打到主日志一份
+		return
+	}
+
+	// 4. 既非鉴权握手、也不在白名单 —— 此时才计入速率限制
+	if blocked, reason := checkRateLimit(rlKey); blocked {
+		msg := fmt.Sprintf("Blocking connection from %s (%s): %s", host, rlKey, reason)
+		log.Println(msg)
 		if blockLogger != nil {
 			blockLogger.Println(msg)
 		}
-		reportEvent(EventDecision, host, "未知", "拦截", "未在白名单")
+		reportEvent(EventDecision, host, "未知", "拦截", reason)
 		conn.Close()
+		return
 	}
+
+	// 记录拒绝日志到单独文件
+	msg := fmt.Sprintf("Blocking connection from %s (Not Whitelisted)", host)
+	log.Println(msg) // 同时也打到主日志一份
+	if blockLogger != nil {
+		blockLogger.Println(msg)
+	}
+	reportEvent(EventDecision, host, "未知", "拦截", "未在白名单")
+	conn.Close()
 }
 
 // handleAuthChallenge 处理认证第一阶段：生成并发送 challenge
